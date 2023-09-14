@@ -7,17 +7,36 @@ import torch
 from collections import defaultdict
 from glob import glob
 from tqdm import tqdm
+import time
 
 # Load all tokenized games
 all_tokens = []
-# game_files = glob("./token_files/*.txt")  # Add more files if you have them
-game_files = ["./token_files/[2022-10-18]-0022200001-PHI@BOS.txt"]
-for game_file in game_files:
+# game_tokens = []
+
+game_files = glob("./token_files/*.txt")  # Add more files if you have them
+# game_files = ["./token_files/[2022-10-18]-0022200001-PHI@BOS.txt"]
+# for game_file in game_files:
+#     with open(game_file, 'r') as f:
+#         game_tokens = f.read().splitlines()
+#         game_tokens = game_tokens.split('|')
+#         all_tokens.extend(game_tokens)
+
+for game_file in tqdm(game_files, desc="Loading tokens"):
     with open(game_file, 'r') as f:
         game_tokens = f.read().splitlines()
-        all_tokens.extend(game_tokens)
+        for line in game_tokens:
+            line_tokens = line.split('|')
+            all_tokens.extend(line_tokens)
 
-print("Length of all tokens: ", len(all_tokens))
+# for game_file in game_files[:5]:
+#     curr_tokens = []
+#     with open(game_file, 'r') as f:
+#         game_tokens = f.read().splitlines()
+#         curr_tokens.extend(game_tokens)
+#     game_tokens.append(curr_tokens)
+
+print("Length of all tokens: ", len(set(all_tokens)))
+print("Number of Games: ", len(game_files))
 
 # Create a vocabulary and map each token to a unique integer ID
 token_to_id = {token: idx for idx, token in enumerate(set(all_tokens))}
@@ -27,9 +46,11 @@ id_to_token = {idx: token for token, idx in token_to_id.items()}
 all_ids = [token_to_id[token] for token in all_tokens]
 
 # Split data into training and validation sets
-train_size = int(1 * len(all_ids))
+train_size = int(0.8 * len(all_ids))
 train_data = all_ids[:train_size]
-# val_data = all_ids[train_size:]
+val_data = all_ids[train_size:]
+
+# assert False
 
 # Save the token-to-ID mapping for future reference
 with open("token_to_id.txt", 'w') as f:
@@ -41,11 +62,11 @@ print("Data preparation completed!")
 # Define the model configuration
 config = GPT2Config(
     vocab_size=len(token_to_id),
-    n_positions=1024,  # Maximum sequence length
-    n_ctx=50,        # Size of the context window
-    n_embd=1024,        # Embedding size
-    n_layer=8,        # Number of transformer layers
-    n_head=8,         # Number of multi-head attention heads
+    n_positions=600,  # Maximum sequence length
+    n_ctx=500,        # Size of the context window
+    n_embd=12*8,        # Embedding size
+    n_layer=12,        # Number of transformer layers
+    n_head=12,         # Number of multi-head attention heads
     pad_token_id=0     # ID for the padding token (can set it to 0 if not using padding)
 )
 
@@ -58,31 +79,49 @@ print("Using device:", device)
 model.to(device)
 
 # Define the optimizer and learning rate scheduler
-optimizer = AdamW(model.parameters(), lr=3e-2)
+optimizer = AdamW(model.parameters(), lr=3e-4)
 # scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0, num_training_steps=len(train_data))
 
 print("Model defined and ready for training!")
 
 # Hyperparameters
 # BATCH_SIZE = 32
-BATCH_SIZE = 1024
-EPOCHS = 50000
+BATCH_SIZE = 64
+EPOCHS = 240
 GRADIENT_ACCUMULATION_STEPS = 1
 MAX_SEQ_LEN = 600
 
 # Create PyTorch DataLoader
-input_data = torch.tensor(train_data[:-1], dtype=torch.long)  # All tokens except the last
-target_data = torch.tensor(train_data[1:], dtype=torch.long)  # All tokens except the first
+# input_data = torch.tensor(train_data[:-1], dtype=torch.long)  # All tokens except the last
+# target_data = torch.tensor(train_data[1:], dtype=torch.long)  # All tokens except the first
+
+# Create the training dataset
+input_data, target_data = [], []
+for i in range(0, len(train_data) - MAX_SEQ_LEN, MAX_SEQ_LEN):
+    input_data.append(train_data[i:i+MAX_SEQ_LEN])
+    target_data.append(train_data[i+1:i+MAX_SEQ_LEN+1])
+input_data = torch.tensor(input_data, dtype=torch.long)
+target_data = torch.tensor(target_data, dtype=torch.long)
+
+# Create the validation dataset
+val_input_data, val_target_data = [], []
+for i in range(0, len(val_data) - MAX_SEQ_LEN, MAX_SEQ_LEN):
+    val_input_data.append(val_data[i:i+MAX_SEQ_LEN])
+    val_target_data.append(val_data[i+1:i+MAX_SEQ_LEN+1])
+val_input_data = torch.tensor(val_input_data, dtype=torch.long)
+val_target_data = torch.tensor(val_target_data, dtype=torch.long)
 
 
 dataset = TensorDataset(input_data, target_data)
 loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
 
 training_losses = []
+validation_losses = []
 
 # Training loop
 model.train()
 for epoch in range(EPOCHS):
+    epoch_start = time.time()
     total_loss = 0.0
     for batch_idx, (input_batch, target_batch) in enumerate(loader):
 
@@ -104,21 +143,37 @@ for epoch in range(EPOCHS):
 
         # print(scheduler.get_last_lr())
 
+    # Save model checkpoint
+    torch.save(model.state_dict(), f"./model_checkpoints/model_epoch_{epoch + 1}.pt")
+
+    # Get validation loss
+    model.eval()
+    with torch.no_grad():
+        val_input_data, val_target_data = val_input_data.to(device), val_target_data.to(device)
+        outputs = model(val_input_data, labels=val_target_data)
+        val_loss = outputs.loss
+        validation_losses.append(val_loss.item())
+
+    model.train()
+
     # Print epoch results
     avg_loss = total_loss / len(loader)
     training_losses.append(avg_loss)
 
-    print(f"Epoch: {epoch + 1}, Loss: {avg_loss:.4f}")
+    print(f"Epoch: {epoch + 1}, Loss: {avg_loss:.4f}, Val Loss: {val_loss:.4f},"
+          f" Time: {time.time() - epoch_start:.4f}s")
 
 print("Training complete!")
 
 # Everything after this is for validation and can be ignored for now. I'm cleaning it up into sepearate files.
 # _____________________________________________________________________________
 
-# plt.plot(training_losses)
-# plt.xlabel("Epoch")
-# plt.ylabel("Loss")
-# plt.show()
+plt.plot(training_losses)
+plt.plot(validation_losses)
+plt.legend(["Training Loss", "Validation Loss"])
+plt.xlabel("Epoch")
+plt.ylabel("Loss")
+plt.show()
 
 # Hyperparameters for validation
 VAL_BATCH_SIZE = 32
@@ -157,7 +212,7 @@ model.eval()
 # print(f"Perplexity: {perplexity:.4f}")
 
 
-def generate_sequence(model, starting_tokens, max_length=512, top_k=50):
+def generate_sequence(model, starting_tokens, max_length=1000, top_k=1):
     """
     Generate a sequence using the trained model.
 
@@ -243,7 +298,7 @@ with open(f'./sample_gen.txt', 'w') as f:
         f.write(f"{token}\n")
 
 lengths = []
-for i in tqdm(range(1000)):
+for i in tqdm(range(300)):
     generated_tokens = generate_sequence(model, starting_tokens)
     lengths.append(len(generated_tokens))
 sum(lengths) / len(lengths)
