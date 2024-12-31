@@ -1,4 +1,8 @@
 import json
+import csv
+import glob
+import os
+import re
 from pathlib import Path
 from typing import List, Dict, Any
 from datasets import Dataset
@@ -6,6 +10,7 @@ import pandas as pd
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
+from tqdm import tqdm
 
 class GameEventProcessor:
     """Process NBA game events into structured data"""
@@ -174,30 +179,195 @@ class GameEventProcessor:
         tokenizer.save(save_path)
         return tokenizer
     
-    def process_game_file(self, file_path: str) -> List[Dict[str, Any]]:
-        """Process a game file into structured events with states"""
+    def process_csv_file(self, filepath: str) -> List[Dict[str, Any]]:
+        """Process a single CSV game file into structured events with states"""
         structured_data = []
-        current_state = None
         
-        with open(file_path, 'r') as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
+        # Helper functions from process_text.py
+        def determine_period_label(period_num):
+            if period_num == 1: return "Q1"
+            elif period_num == 2: return "Q2"
+            elif period_num == 3: return "Q3"
+            elif period_num == 4: return "Q4"
+            else: return f"OT{period_num-4}"
+            
+        def determine_shot_type(distance):
+            if distance is None: return "2PT"
+            return "3PT" if distance > 22 else "2PT"
+            
+        def underscore_name(name):
+            if not name: return name
+            return re.sub(r"[^\w]", "_", name.strip())
+            
+        def parse_teams_from_filename(filename):
+            base = os.path.basename(filename)
+            parts = base.split('-')
+            last_part = parts[-1].replace('.csv', '')
+            if '@' in last_part:
+                away_team, home_team = last_part.split('@', 1)
+                return away_team, home_team
+            return "AWAY", "HOME"
+        
+        # Get team names from filename
+        away_team, home_team = parse_teams_from_filename(filepath)
+        self.team_names.update([away_team, home_team])
+        
+        # Track players on court
+        away_team_players = set()
+        home_team_players = set()
+        on_court_away = set()
+        on_court_home = set()
+        
+        # Read all rows first to identify players
+        all_rows = []
+        with open(filepath, "r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                all_rows.append(row)
+                # Track all players
+                for player in [row['a1'], row['a2'], row['a3'], row['a4'], row['a5']]:
+                    if player:
+                        player = underscore_name(player.strip())
+                        away_team_players.add(player)
+                        on_court_away.add(player)
+                for player in [row['h1'], row['h2'], row['h3'], row['h4'], row['h5']]:
+                    if player:
+                        player = underscore_name(player.strip())
+                        home_team_players.add(player)
+                        on_court_home.add(player)
+        
+        self.player_names.update(away_team_players)
+        self.player_names.update(home_team_players)
+        
+        # Process each row
+        for i, row in enumerate(all_rows):
+            # Create game state
+            period_label = determine_period_label(int(row['period']))
+            state = {
+                "quarter": period_label,
+                "time": row['remaining_time'],
+                "score": {
+                    "home": int(row['home_score']),
+                    "away": int(row['away_score'])
+                },
+                "home_away": "Home",  # Default to home perspective
+                "teams": {
+                    "home": {
+                        "name": home_team,
+                        "players": sorted(list(on_court_home))
+                    },
+                    "away": {
+                        "name": away_team,
+                        "players": sorted(list(on_court_away))
+                    }
+                }
+            }
+            
+            # Process event
+            event_type = row['event_type'].lower() if row['event_type'] else ""
+            event_type_long = row["type"].lower() if row["type"] else ""
+            team = row['team'].strip() if row['team'] else ""
+            player = underscore_name(row['player']) if row['player'] else None
+            
+            event = None
+            
+            if event_type == "shot":
+                shot_distance = row['shot_distance'] if row['shot_distance'] else None
+                shot_type = determine_shot_type(float(shot_distance) if shot_distance else None)
+                event = {
+                    "team": team,
+                    "type": "Shot",
+                    "details": {
+                        "player": player,
+                        "shot_type": shot_type,
+                        "result": "Made" if row['result'].lower() == "made" else "Missed",
+                        "assist": underscore_name(row['assist']) if row['assist'] else None,
+                        "block": underscore_name(row['block']) if row['block'] else None,
+                        "location_x": row['original_x'] if row['original_x'] else None,
+                        "location_y": row['original_y'] if row['original_y'] else None
+                    }
+                }
+            
+            elif event_type == "substitution":
+                in_player = underscore_name(row['entered'])
+                out_player = underscore_name(row['left'])
                 
-                if "OnCourt" in line:  # This is a game state line
-                    current_state = self.parse_game_state(line)
-                elif "<EVENT_END>" in line:  # This is an event line
-                    event_text = line.split("<EVENT_END>")[0].strip()
-                    event_data = self.parse_event(event_text)
-                    
-                    # Combine event with current state
-                    structured_data.append({
-                        "state": current_state,
-                        "event": event_data
-                    })
+                # Update on-court players
+                if in_player in away_team_players:
+                    on_court_away.add(in_player)
+                    on_court_away.remove(out_player)
+                elif in_player in home_team_players:
+                    on_court_home.add(in_player)
+                    on_court_home.remove(out_player)
+                
+                event = {
+                    "team": team,
+                    "type": "Substitution",
+                    "details": {
+                        "player_in": in_player,
+                        "player_out": out_player
+                    }
+                }
+            
+            elif event_type == "free throw":
+                event = {
+                    "team": team,
+                    "type": "FreeThrow",
+                    "details": {
+                        "player": player,
+                        "result": "Made" if row['result'].lower() == "made" else "Missed",
+                        "number": row['num'],
+                        "out_of": row['outof']
+                    }
+                }
+            
+            elif event_type == "rebound":
+                event = {
+                    "team": team,
+                    "type": "Rebound",
+                    "details": {
+                        "player": player,
+                        "rebound_type": "Offensive" if "offensive" in event_type_long else "Defensive"
+                    }
+                }
+            
+            elif event_type == "turnover":
+                event = {
+                    "team": team,
+                    "type": "Turnover",
+                    "details": {
+                        "player": player
+                    }
+                }
+            
+            elif event_type == "foul":
+                event = {
+                    "team": team,
+                    "type": "Foul",
+                    "details": {
+                        "player": player,
+                        "fouled_player": underscore_name(row['opponent']) if row['opponent'] else None,
+                        "foul_type": row['reason'] if row['reason'] else None
+                    }
+                }
+            
+            # Add event to structured data if we processed it
+            if event:
+                self.action_types.add(event["type"])
+                structured_data.append({
+                    "state": state,
+                    "event": event
+                })
         
         return structured_data
+
+def process_game_files(self, data_dir: str = "./data") -> List[Dict[str, Any]]:
+        """Process all game files in the data directory"""
+        all_data = []
+        for filepath in glob.glob(os.path.join(data_dir, "*.csv")):
+            game_data = self.process_csv_file(filepath)
+            all_data.extend(game_data)
+        return all_data
 
 def create_dataset(game_data: List[Dict[str, Any]]) -> Dataset:
     """Convert structured game data into a HuggingFace dataset"""
@@ -231,23 +401,31 @@ def main():
     # Initialize processor
     processor = GameEventProcessor()
     
-    # Process game file
-    game_data = processor.process_game_file("all_games.txt")
+    print("Processing game files from ./data/*.csv")
+    # Process all game files
+    game_data = processor.process_game_files("./data")
+    
+    if not game_data:
+        print("No game data found in ./data/. Please ensure CSV files are present.")
+        return
     
     # Create and save tokenizer
+    print("Creating tokenizer...")
     tokenizer = processor.create_tokenizer()
     
     # Create dataset
+    print("Creating dataset...")
     dataset = create_dataset(game_data)
     
     # Save processed data
+    print("Saving processed data...")
     with open("processed_games.json", "w") as f:
         json.dump(game_data, f, indent=2)
     
     # Save dataset
     dataset.save_to_disk("nba_games_dataset")
     
-    print(f"Processed data saved to processed_games.json")
+    print(f"\nProcessed data saved to processed_games.json")
     print(f"Dataset saved to nba_games_dataset/")
     print(f"Tokenizer saved to game_tokenizer.json")
     print(f"\nDataset statistics:")
